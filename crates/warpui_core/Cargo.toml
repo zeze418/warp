@@ -48,6 +48,7 @@ openh264 = { workspace = true, optional = true }
 infer = "0.19.0"
 instant.workspace = true
 itertools.workspace = true
+jieba-rs.workspace = true
 lazy_static = "1.4.0"
 log = "0.4"
 schemars = { version = "1", optional = true }

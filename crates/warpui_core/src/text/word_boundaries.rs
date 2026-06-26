@@ -5,6 +5,7 @@ use std::iter::Peekable;
 use itertools::Either;
 use string_offset::CharOffset;
 
+use super::cjk;
 use super::point::Point;
 use super::words::is_default_word_boundary;
 use super::TextBuffer;
@@ -49,6 +50,21 @@ pub struct WordBoundaries<'a, T: TextBuffer + ?Sized> {
     approach: WordBoundariesApproach,
     policy: Cow<'a, WordBoundariesPolicy>,
     done: bool,
+    /// The offset the iterator was created at, before any stepping. Used to seed CJK segmentation.
+    start_offset: CharOffset,
+    /// Whether to merge in CJK (Chinese) dictionary-segmentation boundaries.
+    cjk_enabled: bool,
+    /// Whether a CJK cut exactly at `start_offset` should be yielded (matches the inclusive vs.
+    /// exclusive semantics of the constructor this iterator came from).
+    cjk_inclusive: bool,
+    /// Whether [`Self::init_cjk`] has run yet (CJK cuts are computed lazily on first use).
+    cjk_initialized: bool,
+    /// Precomputed CJK boundary offsets, ordered in the direction of travel.
+    cjk_cuts: Peekable<std::vec::IntoIter<CharOffset>>,
+    /// One-item lookahead for the separator-based boundary stream, used while merging.
+    pending_base: Option<Point>,
+    /// Whether the separator-based stream has been exhausted.
+    base_done: bool,
 }
 
 impl<'a, T: TextBuffer + ?Sized> WordBoundaries<'a, T> {
@@ -57,17 +73,52 @@ impl<'a, T: TextBuffer + ?Sized> WordBoundaries<'a, T> {
         self
     }
 
-    /// Create an iterator that will return the starts of words moving forwards
-    pub fn forward_starts(offset: CharOffset, chars: T::Chars<'a>, buffer: &'a T) -> Self {
+    /// Whether CJK (Chinese) dictionary segmentation is merged into the boundary stream in
+    /// addition to the separator-based boundaries. Enabled by default; see [`super::cjk`]. This is
+    /// a no-op for text that contains no Han characters.
+    pub fn with_cjk(mut self, enabled: bool) -> Self {
+        self.cjk_enabled = enabled;
+        self
+    }
+
+    /// Shared constructor that fills in the common defaults. `cjk_inclusive` mirrors whether the
+    /// chosen approach includes a boundary sitting exactly on the starting offset.
+    fn build(
+        offset: CharOffset,
+        chars: Peekable<Either<T::Chars<'a>, T::CharsReverse<'a>>>,
+        buffer: &'a T,
+        in_word: bool,
+        approach: WordBoundariesApproach,
+        cjk_inclusive: bool,
+    ) -> Self {
         Self {
             offset,
+            chars,
             buffer,
-            chars: Either::Left(chars).peekable(),
-            in_word: true,
-            approach: WordBoundariesApproach::ForwardWordStarts,
+            in_word,
+            approach,
             policy: Cow::Owned(WordBoundariesPolicy::Default),
             done: false,
+            start_offset: offset,
+            cjk_enabled: true,
+            cjk_inclusive,
+            cjk_initialized: false,
+            cjk_cuts: Vec::new().into_iter().peekable(),
+            pending_base: None,
+            base_done: false,
         }
+    }
+
+    /// Create an iterator that will return the starts of words moving forwards
+    pub fn forward_starts(offset: CharOffset, chars: T::Chars<'a>, buffer: &'a T) -> Self {
+        Self::build(
+            offset,
+            Either::Left(chars).peekable(),
+            buffer,
+            true,
+            WordBoundariesApproach::ForwardWordStarts,
+            false,
+        )
     }
 
     /// Create an iterator that will return the ends of words moving forwards, exclusive of the
@@ -77,15 +128,14 @@ impl<'a, T: TextBuffer + ?Sized> WordBoundaries<'a, T> {
     /// the 'word'), this will yield columns [8, 12, 18], the ends of `one`, `two`, and `three`,
     /// but _excluding_ the initial position at the end of `word`.
     pub fn forward_ends_exclusive(offset: CharOffset, chars: T::Chars<'a>, buffer: &'a T) -> Self {
-        Self {
+        Self::build(
             offset,
+            Either::Left(chars).peekable(),
             buffer,
-            chars: Either::Left(chars).peekable(),
-            in_word: false,
-            approach: WordBoundariesApproach::ForwardWordEnds,
-            policy: Cow::Owned(WordBoundariesPolicy::Default),
-            done: false,
-        }
+            false,
+            WordBoundariesApproach::ForwardWordEnds,
+            false,
+        )
     }
 
     /// Create an iterator that will return the ends of words moving forwards, inclusive of the
@@ -95,15 +145,14 @@ impl<'a, T: TextBuffer + ?Sized> WordBoundaries<'a, T> {
     /// the 'word'), this will yield columns [4, 8, 12, 18], the ends of all four words,
     /// _including_ the initial position at the end of `word`.
     pub fn forward_ends_inclusive(offset: CharOffset, chars: T::Chars<'a>, buffer: &'a T) -> Self {
-        Self {
+        Self::build(
             offset,
+            Either::Left(chars).peekable(),
             buffer,
-            chars: Either::Left(chars).peekable(),
-            in_word: true,
-            approach: WordBoundariesApproach::ForwardWordEnds,
-            policy: Cow::Owned(WordBoundariesPolicy::Default),
-            done: false,
-        }
+            true,
+            WordBoundariesApproach::ForwardWordEnds,
+            true,
+        )
     }
 
     /// Create an iterator that will return the starts of words moving _backwards_, exclusive of
@@ -117,15 +166,14 @@ impl<'a, T: TextBuffer + ?Sized> WordBoundaries<'a, T> {
         chars: T::CharsReverse<'a>,
         buffer: &'a T,
     ) -> Self {
-        Self {
+        Self::build(
             offset,
+            Either::Right(chars).peekable(),
             buffer,
-            chars: Either::Right(chars).peekable(),
-            in_word: false,
-            approach: WordBoundariesApproach::BackwardWordStarts,
-            policy: Cow::Owned(WordBoundariesPolicy::Default),
-            done: false,
-        }
+            false,
+            WordBoundariesApproach::BackwardWordStarts,
+            false,
+        )
     }
 
     /// Create an iterator that will return the starts of words moving _backwards_, inclusive of
@@ -139,15 +187,14 @@ impl<'a, T: TextBuffer + ?Sized> WordBoundaries<'a, T> {
         chars: T::CharsReverse<'a>,
         buffer: &'a T,
     ) -> Self {
-        Self {
+        Self::build(
             offset,
+            Either::Right(chars).peekable(),
             buffer,
-            chars: Either::Right(chars).peekable(),
-            in_word: true,
-            approach: WordBoundariesApproach::BackwardWordStarts,
-            policy: Cow::Owned(WordBoundariesPolicy::Default),
-            done: false,
-        }
+            true,
+            WordBoundariesApproach::BackwardWordStarts,
+            true,
+        )
     }
 
     fn step(&mut self) {
@@ -165,12 +212,70 @@ impl<'a, T: TextBuffer + ?Sized> WordBoundaries<'a, T> {
     fn is_word_boundary(&self, c: char) -> bool {
         self.policy.is_word_boundary(c)
     }
-}
 
-impl<T: TextBuffer + ?Sized> Iterator for WordBoundaries<'_, T> {
-    type Item = Point;
+    /// Whether this iterator advances toward higher offsets.
+    fn travel_forward(&self) -> bool {
+        matches!(
+            self.approach,
+            WordBoundariesApproach::ForwardWordStarts | WordBoundariesApproach::ForwardWordEnds
+        )
+    }
 
-    fn next(&mut self) -> Option<Self::Item> {
+    /// Lazily compute the CJK segmentation boundaries relevant to this traversal and store them in
+    /// `cjk_cuts`, ordered in the direction of travel. This reads a bounded window of text around
+    /// the start offset so that runs of Han characters can be segmented as whole words.
+    fn init_cjk(&mut self) {
+        self.cjk_initialized = true;
+
+        // How far (in characters) to look on either side of the start offset for CJK runs. This
+        // bounds the cost on very large buffers; text-input buffers are far shorter than this.
+        const CJK_WINDOW: usize = 2048;
+
+        let start = self.start_offset;
+
+        // Read up to `CJK_WINDOW` characters before the start (in reverse), then restore reading
+        // order so the window is a single left-to-right slice of characters. Reading from both
+        // sides lets us segment a run that the start offset sits in the middle of.
+        let mut window: Vec<char> = self
+            .buffer
+            .chars_rev_at(start)
+            .map(|chars| chars.take(CJK_WINDOW).collect())
+            .unwrap_or_default();
+        let before_count = window.len();
+        window.reverse();
+
+        if let Ok(chars) = self.buffer.chars_at(start) {
+            window.extend(chars.take(CJK_WINDOW));
+        }
+
+        let window_start = start.as_usize().saturating_sub(before_count);
+        let start_usize = start.as_usize();
+
+        let mut cuts: Vec<CharOffset> = cjk::interior_cuts_in_chars(&window, window_start)
+            .into_iter()
+            .map(CharOffset::from)
+            .filter(|cut| {
+                let offset = cut.as_usize();
+                match (self.travel_forward(), self.cjk_inclusive) {
+                    (true, true) => offset >= start_usize,
+                    (true, false) => offset > start_usize,
+                    (false, true) => offset <= start_usize,
+                    (false, false) => offset < start_usize,
+                }
+            })
+            .collect();
+
+        if self.travel_forward() {
+            cuts.sort_by_key(|cut| cut.as_usize());
+        } else {
+            cuts.sort_by_key(|cut| std::cmp::Reverse(cut.as_usize()));
+        }
+
+        self.cjk_cuts = cuts.into_iter().peekable();
+    }
+
+    /// The separator-based boundary stream: the original word-boundary logic, unaware of CJK.
+    fn next_separator_boundary(&mut self) -> Option<Point> {
         while let Some(&c) = self.chars.peek() {
             match self.approach {
                 // For forward word starts, we look for the transition from not in a word (i.e. in
@@ -228,6 +333,75 @@ impl<T: TextBuffer + ?Sized> Iterator for WordBoundaries<'_, T> {
             self.done = true;
 
             self.buffer.to_point(self.offset).ok()
+        }
+    }
+}
+
+impl<T: TextBuffer + ?Sized> Iterator for WordBoundaries<'_, T> {
+    type Item = Point;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let cjk_active =
+            self.cjk_enabled && !matches!(&*self.policy, WordBoundariesPolicy::OnlyWhitespace);
+        if !cjk_active {
+            return self.next_separator_boundary();
+        }
+
+        if !self.cjk_initialized {
+            self.init_cjk();
+        }
+
+        // Merge the separator-based boundary stream with the precomputed CJK cut stream. Both are
+        // monotonic in the direction of travel, so we emit whichever boundary comes next,
+        // de-duplicating any position that appears in both.
+        loop {
+            if self.pending_base.is_none() && !self.base_done {
+                match self.next_separator_boundary() {
+                    Some(point) => self.pending_base = Some(point),
+                    None => self.base_done = true,
+                }
+            }
+
+            let base_offset = self
+                .pending_base
+                .and_then(|point| self.buffer.to_offset(point).ok())
+                .map(|offset| offset.as_usize());
+            // If we have a pending base boundary but can't resolve it for comparison, just emit it
+            // rather than dropping it.
+            if self.pending_base.is_some() && base_offset.is_none() {
+                return self.pending_base.take();
+            }
+            let cjk_offset = self.cjk_cuts.peek().map(|cut| cut.as_usize());
+
+            match (base_offset, cjk_offset) {
+                (None, None) => return None,
+                (Some(_), None) => return self.pending_base.take(),
+                (None, Some(_)) => {
+                    let cut = self.cjk_cuts.next()?;
+                    if let Ok(point) = self.buffer.to_point(cut) {
+                        return Some(point);
+                    }
+                }
+                (Some(base), Some(cjk)) => {
+                    if base == cjk {
+                        // Same position from both streams; consume both, emit once.
+                        self.cjk_cuts.next();
+                        return self.pending_base.take();
+                    }
+                    let take_base = if self.travel_forward() {
+                        base < cjk
+                    } else {
+                        base > cjk
+                    };
+                    if take_base {
+                        return self.pending_base.take();
+                    }
+                    let cut = self.cjk_cuts.next()?;
+                    if let Ok(point) = self.buffer.to_point(cut) {
+                        return Some(point);
+                    }
+                }
+            }
         }
     }
 }

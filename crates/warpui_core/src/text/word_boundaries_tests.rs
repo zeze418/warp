@@ -211,6 +211,88 @@ fn test_word_boundaries() {
 }
 
 #[test]
+fn test_cjk_word_boundaries() {
+    // "我喜欢吃苹果" segments as 我 | 喜欢 | 吃 | 苹果.
+    // char offsets: 我0 喜1 欢2 吃3 苹4 果5  (length 6)
+    let buffer = "我喜欢吃苹果";
+
+    // Forward word ends (Option+Right / forward word motion): one boundary per word, finishing
+    // with the end of the buffer.
+    let ends: Vec<_> = buffer
+        .word_ends_from_offset_exclusive(Point::zero())
+        .unwrap()
+        .collect();
+    assert_eq!(
+        ends,
+        [
+            Point::new(0, 1), // 我
+            Point::new(0, 3), // 喜欢
+            Point::new(0, 4), // 吃
+            Point::new(0, 6), // 苹果 (also the buffer end)
+        ]
+    );
+
+    // Backward word starts (Option+Left / Option+Delete): word-by-word from the end.
+    let starts_back: Vec<_> = buffer
+        .word_starts_backward_from_offset_exclusive(Point::new(0, 6))
+        .unwrap()
+        .collect();
+    assert_eq!(
+        starts_back,
+        [
+            Point::new(0, 4), // start of 苹果
+            Point::new(0, 3), // start of 吃
+            Point::new(0, 1), // start of 喜欢
+            Point::new(0, 0), // start of 我
+        ]
+    );
+}
+
+#[test]
+fn test_cjk_mixed_with_ascii() {
+    // "你好 世界朋友": 你好 is a single word; 世界朋友 -> 世界 | 朋友. The ASCII space is an
+    // ordinary separator handled by the existing logic.
+    // offsets: 你0 好1 <space>2 世3 界4 朋5 友6  (length 7)
+    let buffer = "你好 世界朋友";
+    let ends: Vec<_> = buffer
+        .word_ends_from_offset_exclusive(Point::zero())
+        .unwrap()
+        .collect();
+    assert_eq!(
+        ends,
+        [
+            Point::new(0, 2), // 你好
+            Point::new(0, 5), // 世界
+            Point::new(0, 7), // 朋友 (also the buffer end)
+        ]
+    );
+}
+
+#[test]
+fn test_cjk_can_be_disabled() {
+    // With CJK segmentation turned off, a Han run is a single word again (legacy behavior).
+    let buffer = "我喜欢吃苹果";
+    let ends: Vec<_> = buffer
+        .word_ends_from_offset_exclusive(Point::zero())
+        .unwrap()
+        .with_cjk(false)
+        .collect();
+    assert_eq!(ends, [Point::new(0, 6)]);
+}
+
+#[test]
+fn test_cjk_only_whitespace_policy_does_not_segment() {
+    // The OnlyWhitespace policy must not trigger dictionary segmentation.
+    let buffer = "我喜欢吃苹果";
+    let ends: Vec<_> = buffer
+        .word_ends_from_offset_exclusive(Point::zero())
+        .unwrap()
+        .with_policy(WordBoundariesPolicy::OnlyWhitespace)
+        .collect();
+    assert_eq!(ends, [Point::new(0, 6)]);
+}
+
+#[test]
 fn test_unicode_whitespace() {
     // See https://en.wikipedia.org/wiki/Whitespace_character
     let text = "first\tsecond\u{A0}third\u{2003}fourth";

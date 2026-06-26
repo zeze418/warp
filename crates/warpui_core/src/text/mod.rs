@@ -6,6 +6,7 @@ use self::point::Point;
 use self::word_boundaries::{WordBoundaries, WordBoundariesPolicy};
 use crate::event::ModifiersState;
 
+pub mod cjk;
 pub mod header;
 pub mod point;
 pub mod word_boundaries;
