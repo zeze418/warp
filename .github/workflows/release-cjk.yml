@@ -1,0 +1,91 @@
+name: Release (CJK fork)
+
+# Builds the OSS-channel WarpOss app *with Chinese (CJK) word segmentation* and
+# publishes it as a GitHub Release. Self-contained: installs every build
+# dependency on a GitHub-hosted Apple Silicon macOS runner (does NOT rely on
+# Warp's internal/self-hosted CI infrastructure).
+#
+# Usage:
+#   - Recommended: from the `mine` branch, create and push a tag, e.g.
+#       git tag cjk-v0.1.1 && git push origin cjk-v0.1.1
+#     The pushed tag triggers this workflow and a Release is published for it.
+#   - Or run it manually from the Actions tab ("Run workflow" on the `mine`
+#     branch) and provide a tag name.
+#
+# Note: Actions must be enabled for this fork (Settings -> Actions). The build
+# is ad-hoc signed and NOT Apple-notarized, so downloaders run it after:
+#   xattr -dr com.apple.quarantine /Applications/WarpOss.app
+
+on:
+  push:
+    tags:
+      - 'cjk-v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to create (e.g. cjk-v0.1.1)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos:
+    runs-on: macos-15
+    env:
+      WARP_BIN_NAME: warp-oss
+      WARP_CHANNEL: oss
+      FEATURES: gui
+      WARP_SKIP_COMMON_SKILLS_INSTALL: "1"
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve release tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install protobuf (protoc)
+        run: brew install protobuf
+
+      - name: Download Metal toolchain
+        run: xcodebuild -downloadComponent MetalToolchain || true
+
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        run: rustup show
+
+      - name: Install cargo-bundle
+        run: cargo install cargo-bundle --locked
+
+      - name: Build release bundle (WarpOss + CJK)
+        run: ./script/macos/run --release --dont-open
+
+      - name: Package .app into a zip
+        id: pkg
+        run: |
+          TAG='${{ steps.tag.outputs.tag }}'
+          ZIP="WarpOss-${TAG}-macos-arm64.zip"
+          ditto -c -k --keepParent "target/release/bundle/osx/WarpOss.app" "$ZIP"
+          echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG='${{ steps.tag.outputs.tag }}'
+          ZIP='${{ steps.pkg.outputs.zip }}'
+          NOTES=$'⚠️ Unofficial fork of Warp — not affiliated with Warp.\n\nWarpOss + Chinese (CJK) word segmentation. Apple Silicon macOS only · ad-hoc signed, NOT notarized · AGPL-3.0 (source in this repo).\n\nInstall: unzip, move WarpOss.app to /Applications, then first-open with:\n`xattr -dr com.apple.quarantine /Applications/WarpOss.app`'
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$ZIP" -R "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" "$ZIP" \
+              -R "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "WarpOss + 中文分词 $TAG（非官方 fork）" \
+              --notes "$NOTES"
+          fi
